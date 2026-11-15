@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Persist and restore Pi sessions in Herdr Core terminals."""
+import argparse
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+LABEL = "hc-agent-resume.record"
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh"}
+# Guards against duplicate delivery from a stale event snapshot during this
+# supervisor process's lifetime. The persisted resumingShellPid guard covers
+# service restarts too.
+CLAIMED = set()
+
+# Adding an agent is intentionally data-first: add its fixed resume argv here,
+# then add the agent's thin session-start/session-end integration.
+ADAPTERS = {
+    "pi": ("pi", "--session"),
+    "claude": ("claude", "--resume"),
+    "codex": ("codex", "resume"),
+}
+
+
+def hc(*args, input_text=None):
+    return subprocess.run(["hc", *args], input=input_text, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def hc_json(*args):
+    result = hc(*args)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "hc failed")
+    return json.loads(result.stdout)
+
+
+def terminal_id():
+    value = os.environ.get("HC_TERMINAL_ID")
+    if not value:
+        raise RuntimeError("HC_TERMINAL_ID is not set")
+    return value
+
+
+def encode(record):
+    raw = json.dumps(record, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode(value):
+    if not value:
+        return None
+    try:
+        record = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+        required = {"version", "agent", "session", "cwd", "shellPid"}
+        return record if record.get("version") == 1 and required <= record.keys() else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def record_of(terminal):
+    return decode(terminal.get("labels", {}).get(LABEL))
+
+
+def label(address, record):
+    value = "" if record is None else encode(record)
+    result = hc("label", address, f"{LABEL}={value}")
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "could not update terminal label")
+
+
+def is_shell(terminal):
+    argv = terminal.get("foreground", {}).get("argv") or []
+    if not argv:
+        return False
+    return os.path.basename(argv[0]).lstrip("-") in SHELLS
+
+
+def resume_line(record):
+    adapter = ADAPTERS.get(record.get("agent"))
+    if not adapter or not SESSION_RE.fullmatch(str(record.get("session", ""))):
+        return None
+    cwd = record.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isdir(cwd):
+        return None
+    # Bash's %q quoting is delegated to a tiny Bash invocation. Both strings
+    # are data, never evaluated by Python or assembled as executable shell text.
+    quoted = subprocess.run(["bash", "-c", "printf 'cd -- %q && ' \"$1\"; shift; printf '%q ' \"$@\"", "_", cwd, *adapter, record["session"]],
+                            text=True, stdout=subprocess.PIPE, check=True)
+    return quoted.stdout.strip()
+
+
+def should_resume(terminal, record):
+    if not record or terminal.get("state") != "live" or not is_shell(terminal):
+        return False
+    pid = terminal.get("pid")
+    return bool(pid and pid != record.get("shellPid") and pid != record.get("resumingShellPid"))
+
+
+def reconcile(terminal):
+    """Resume exactly one recovered terminal, if its label says it needs it."""
+    address = terminal.get("address", "")
+    if not address or "/" in address:
+        return
+    # Events/snapshots describe a point in time. Re-read before deciding so a
+    # later stale event cannot repeat a command we have already claimed.
+    try:
+        terminal = hc_json("get", address, "--json")
+    except (RuntimeError, json.JSONDecodeError):
+        return
+    key = (address, terminal.get("pid"))
+    if key in CLAIMED:
+        return
+    record = record_of(terminal)
+    if not should_resume(terminal, record):
+        return
+    line = resume_line(record)
+    if not line:
+        return
+    claimed = {**record, "resumingShellPid": terminal["pid"]}
+    CLAIMED.add(key)
+    try:
+        label(terminal["address"], claimed)
+        # Input lands in the recovered, idle Bash. Pi is therefore a direct
+        # foreground child and Herdr receives its OSC status reports.
+        result = hc("send", terminal["address"], line + "\r")
+        if result.returncode:
+            # Sending failed, so allow a future foreground/restarted event to retry.
+            label(terminal["address"], record)
+            CLAIMED.discard(key)
+    except RuntimeError:
+        CLAIMED.discard(key)
+
+
+def cmd_record(args):
+    if args.agent not in ADAPTERS:
+        raise RuntimeError(f"unsupported agent: {args.agent}")
+    address = terminal_id()
+    terminal = hc_json("get", address, "--json")
+    previous = record_of(terminal)
+    item = {
+        "version": 1, "agent": args.agent, "session": args.session,
+        "cwd": args.cwd, "shellPid": terminal["pid"],
+        "recordedAt": int(time.time() * 1000),
+    }
+    if previous and previous.get("resumingShellPid") == terminal["pid"]:
+        item["resumingShellPid"] = terminal["pid"]
+    label(address, item)
+
+
+def cmd_status():
+    terminal = hc_json("get", terminal_id(), "--json")
+    print(json.dumps({"record": record_of(terminal), "terminal": {
+        "address": terminal.get("address"), "state": terminal.get("state"),
+        "foreground": terminal.get("foreground")}}, indent=2))
+
+
+def process_message(message):
+    if message.get("id") == 1 and "result" in message:
+        for terminal in message["result"].get("terminals", []):
+            reconcile(terminal)
+        return
+    params = message.get("params", {})
+    if message.get("method") == "missed":
+        for terminal in params.get("terminals", []):
+            reconcile(terminal)
+    elif message.get("method") == "event" and params.get("terminal"):
+        try:
+            reconcile(hc_json("get", params["terminal"], "--json"))
+        except (RuntimeError, json.JSONDecodeError):
+            pass
+
+
+def watch_connection():
+    process = subprocess.Popen(["hc", "connect"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    try:
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                        "method": "events.subscribe", "params": {}}) + "\n")
+        process.stdin.flush()
+        for line in process.stdout:
+            try:
+                process_message(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    finally:
+        process.kill()
+        process.wait()
+
+
+def cmd_watch():
+    # Reconnecting gives a fresh snapshot, which is the synchronization barrier
+    # after a core restart. There are no shell-start races or time-based guesses.
+    while True:
+        try:
+            watch_connection()
+        except OSError:
+            pass
+        time.sleep(1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    record_parser = sub.add_parser("record")
+    record_parser.add_argument("--agent", required=True)
+    record_parser.add_argument("--session", required=True)
+    record_parser.add_argument("--cwd", required=True)
+    sub.add_parser("forget")
+    sub.add_parser("status")
+    sub.add_parser("watch")
+    args = parser.parse_args()
+    if args.command == "record": cmd_record(args)
+    elif args.command == "forget": label(terminal_id(), None)
+    elif args.command == "status": cmd_status()
+    else: cmd_watch()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as error:
+        print(f"hc-agent-resume: {error}", file=sys.stderr)
+        sys.exit(2)

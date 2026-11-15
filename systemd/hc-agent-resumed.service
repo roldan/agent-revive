@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore coding-agent sessions in Herdr Core terminals
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hc-agent-resume watch
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
