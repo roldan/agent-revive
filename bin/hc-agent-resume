@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
+from shutil import which
 
 LABEL = "hc-agent-resume.record"
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -16,6 +18,9 @@ SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh"}
 # supervisor process's lifetime. The persisted resumingShellPid guard covers
 # service restarts too.
 CLAIMED = set()
+# A systemd user service normally starts with a smaller PATH than an interactive
+# shell. Prefer PATH, then Herdr Core's standard per-user installation path.
+HC = os.environ.get("HC_BIN") or which("hc") or str(Path.home() / ".local/bin/hc")
 
 # Adding an agent is intentionally data-first: add its fixed resume argv here,
 # then add the agent's thin session-start/session-end integration.
@@ -27,7 +32,7 @@ ADAPTERS = {
 
 
 def hc(*args, input_text=None):
-    return subprocess.run(["hc", *args], input=input_text, text=True,
+    return subprocess.run([HC, *args], input=input_text, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -175,7 +180,7 @@ def process_message(message):
 
 
 def watch_connection():
-    process = subprocess.Popen(["hc", "connect"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    process = subprocess.Popen([HC, "connect"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
     try:
         process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1,
